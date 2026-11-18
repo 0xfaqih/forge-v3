@@ -843,7 +843,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
       }
       const entries = tip ? listDirectory(tip, targetPath) : [];
       if (entries.length) {
-        sendJson(res, 200, entries.map((e) => ({ type: e.type, name: e.name, path: e.path, sha: e.oid, size: 0 })));
+        sendJson(res, 200, entries.map((e) => ({ type: e.type === 'tree' ? 'dir' : 'file', name: e.name, path: e.path, sha: e.oid, size: 0 })));
         return;
       }
       sendJson(res, 404, { message: 'Not Found' });
