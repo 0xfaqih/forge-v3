@@ -384,6 +384,11 @@ function pkt(text: string | Buffer): Buffer {
 }
 const FLUSH = Buffer.from('0000', 'ascii');
 const DELIM = Buffer.from('0001', 'ascii');
+const PKT_ACK = pkt('acknowledgments\n');
+const PKT_NAK = pkt('NAK\n');
+const PKT_PACKFILE = pkt('packfile\n');
+const PKT_SHALLOW_INFO = pkt('shallow-info\n');
+const SIDEBAND_EMPTY = pkt(Buffer.from([1]));
 function parsePackets(raw: Buffer): { lines: string[]; consumed: number; bad: boolean } {
   const lines: string[] = [];
   let p = 0;
@@ -580,13 +585,17 @@ function reachableFrom(start: string, maxCommits: number | null): Set<string> {
   return out;
 }
 function sideband(body: Buffer): Buffer {
+  if (!body.length) return SIDEBAND_EMPTY;
   const out: Buffer[] = [];
   for (let p = 0; p < body.length; p += MAX_PKT - 1) {
     const chunk = body.subarray(p, p + MAX_PKT - 1);
-    out.push(pkt(Buffer.concat([Buffer.from([1]), chunk])));
+    const frame = Buffer.allocUnsafe(5 + chunk.length);
+    frame.write((chunk.length + 5).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    frame[4] = 1;
+    chunk.copy(frame, 5);
+    out.push(frame);
   }
-  if (!body.length) out.push(pkt(Buffer.from([1])));
-  return Buffer.concat(out);
+  return out.length === 1 ? (out[0] as Buffer) : Buffer.concat(out);
 }
 function generationDistance(start: string, target: string): number | null {
   const queue: Array<{ oid: string; gen: number }> = [{ oid: start, gen: 0 }];
@@ -602,6 +611,11 @@ function generationDistance(start: string, target: string): number | null {
   return null;
 }
 function fetchResponse(repo: Repo, wants: string[], haves: string[], boundaries: string[], depth: number | null): Buffer {
+  const cacheKey = packCacheKey(wants, haves, boundaries, depth);
+  if (cacheKey !== null) {
+    const hit = packCache.get(cacheKey);
+    if (hit !== undefined) return hit;
+  }
   const excluded = new Set<string>();
   for (const have of haves) for (const oid of reachableFrom(have, boundaries.length ? 1 : null)) excluded.add(oid);
   const send = new Set<string>();
@@ -629,17 +643,13 @@ function fetchResponse(repo: Repo, wants: string[], haves: string[], boundaries:
   for (const boundary of boundaries) {
     if (traversal.has(boundary) && !shallow.includes(boundary)) shallow.push(boundary);
   }
-  const parts: Buffer[] = [];
-  parts.push(pkt('acknowledgments\n'), pkt('NAK\n'), FLUSH);
+  const parts: Buffer[] = [PKT_ACK, PKT_NAK, FLUSH];
   if (shallow.length) {
-    parts.push(pkt('shallow-info\n'));
+    parts.push(PKT_SHALLOW_INFO);
     for (const oid of shallow) parts.push(pkt(`shallow ${oid}\n`));
     parts.push(FLUSH);
   }
-  parts.push(pkt('packfile\n'));
-  const cacheKey = packCacheKey(wants, haves, boundaries, depth);
-  const cached = cacheKey === null ? undefined : packCache.get(cacheKey);
-  if (cached !== undefined) return cached;
+  parts.push(PKT_PACKFILE);
   const items: GitObj[] = [];
   for (const oid of send) {
     const obj = objects.get(oid);
@@ -1301,9 +1311,81 @@ async function handleMcp(req: RawRequest, res: Reply, raw: Buffer): Promise<void
 
 // ---------------------------------------------------------------- process lifecycle
 
-function onRequest(req: RawRequest): void {
-  const res: Reply = { socket: req.socket };
-  void (async () => {
+// Fast path for the two hottest routes: GET /api/v3/repos/{o}/{r}/issues/{n} and
+// POST /api/v3/repos/{o}/{r}/issues. Bypasses `new URL`, segment split/decode, and the
+// async wrapper. Wire behavior (statuses, bodies, headers, cache, auth order) matches
+// handleRest; anything unusual (query strings, encodings, labels, non-GET/POST) falls
+// through to the slow path by returning false.
+const ISSUES_PREFIX = '/api/v3/repos/';
+function fastIssuePath(req: RawRequest, res: Reply): boolean {
+  const method = req.method;
+  if (method !== 'GET' && method !== 'POST') return false;
+  const target = req.target;
+  if (!target.startsWith(ISSUES_PREFIX)) return false;
+  const oEnd = target.indexOf('/', 14);
+  if (oEnd < 15) return false;
+  const rEnd = target.indexOf('/', oEnd + 1);
+  if (rEnd < oEnd + 2) return false;
+  if (!target.startsWith('issues', rEnd + 1)) return false;
+  const after = rEnd + 7;
+  let number = 0;
+  if (method === 'GET') {
+    if (target.charCodeAt(after) !== 47) return false;
+    if (after + 1 >= target.length) return false;
+    for (let i = after + 1; i < target.length; i += 1) {
+      const c = target.charCodeAt(i);
+      if (c < 48 || c > 57) return false;
+      number = number * 10 + (c - 48);
+    }
+    if (target.length - after - 1 > 15) return false;
+  } else if (after !== target.length) {
+    return false;
+  }
+  for (let i = 14; i < rEnd; i += 1) {
+    if (target.charCodeAt(i) === 37) return false;
+  }
+  if (!authorized(req)) { sendJson(res, 401, { message: 'Bad credentials' }); return true; }
+  const key = target.slice(14, rEnd);
+  const repo = repos.get(key);
+  if (repo === undefined || repo.owner !== VIEWER) { sendJson(res, 404, { message: 'Not Found' }); return true; }
+  if (method === 'GET') {
+    if (req.body.length !== 0) return false;
+    const issue = repo.issues.get(number);
+    if (issue === undefined) { sendJson(res, 404, { message: 'Not Found' }); return true; }
+    const cacheKey = `${key}#${number}`;
+    const cached = issueCache.get(cacheKey);
+    if (cached !== undefined) { sendJsonRaw(res, 200, cached); return true; }
+    const text = JSON.stringify(issueJson(issue));
+    issueCache.set(cacheKey, text);
+    sendJsonRaw(res, 200, text);
+    return true;
+  }
+  const raw = req.body;
+  let title = '';
+  let bodyText = '';
+  if (raw.length !== 0) {
+    let value: unknown;
+    try {
+      value = JSON.parse(raw.toString('utf8'));
+    } catch {
+      sendJson(res, 400, { message: 'Problems parsing JSON' });
+      return true;
+    }
+    const obj: Rec = isRec(value) ? value : {};
+    if (Array.isArray(obj.labels) && (obj.labels as unknown[]).length > 0) return false;
+    if (typeof obj.title === 'string') title = obj.title;
+    if (typeof obj.body === 'string') bodyText = obj.body;
+  }
+  const created = addIssueFast(repo, title, bodyText);
+  if (created === null) return false;
+  sendJsonRaw(res, 201, created);
+  return true;
+}
+
+ function onRequest(req: RawRequest): void {
+   const res: Reply = { socket: req.socket };
+  if (fastIssuePath(req, res)) return;
+   void (async () => {
     try {
       const url = new URL(req.target, 'http://forge.local');
       const path = url.pathname;

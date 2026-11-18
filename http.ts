@@ -38,8 +38,10 @@ export function sendRawResponse(socket: Socket, status: number, contentType: str
   if (extra) head += extra;
   head += '\r\n';
   if (text === null) {
+    socket.cork();
     socket.write(head);
     socket.write(bytes as Buffer);
+    socket.uncork();
   } else {
     socket.write(head + (text as string));
   }
