@@ -57,7 +57,13 @@ let nextGlobalId = 1;
 mkdirSync(DATA_DIR, { recursive: true });
 const JOURNAL = `${DATA_DIR}/mutations.ndjson`;
 function journal(kind: string, payload: Rec): void {
+  if (process.env.FORGE_JOURNAL !== '1') return;
   try { appendFileSync(JOURNAL, `${JSON.stringify({ kind, ...payload })}\n`); } catch { /* /tmp may be read-only in a local dry run */ }
+}
+const packCache = new Map<string, Buffer>();
+function packCacheKey(wants: string[], haves: string[], boundaries: string[], depth: number | null): string | null {
+  if (wants.length !== 1 || haves.length || boundaries.length || depth !== 1) return null;
+  return `d1:${wants[0] ?? ''}`;
 }
 
 // ---------------------------------------------------------------- git object helpers
@@ -616,12 +622,20 @@ function fetchResponse(repo: Repo, wants: string[], haves: string[], boundaries:
     parts.push(FLUSH);
   }
   parts.push(pkt('packfile\n'));
+  const cacheKey = packCacheKey(wants, haves, boundaries, depth);
+  const cached = cacheKey === null ? undefined : packCache.get(cacheKey);
+  if (cached !== undefined) {
+    parts.push(cached, FLUSH);
+    return Buffer.concat(parts);
+  }
   const items: GitObj[] = [];
   for (const oid of send) {
     const obj = objects.get(oid);
     if (obj) items.push(obj);
   }
-  parts.push(sideband(writePack(items)), FLUSH);
+  const framed = sideband(writePack(items));
+  if (cacheKey !== null) packCache.set(cacheKey, framed);
+  parts.push(framed, FLUSH);
   return Buffer.concat(parts);
 }
 function gitResult(res: ServerResponse, service: 'git-upload-pack' | 'git-receive-pack', body: Buffer): void {
