@@ -330,6 +330,10 @@ function mergePull(repo: Repo, pull: Pull): { ok: boolean; conflict: boolean; sh
 // ---------------------------------------------------------------- HTTP helpers
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extra: Rec<string> = {}): void {
+  sendJsonRaw(res, status, JSON.stringify(body), extra);
+}
+const issueCache = new Map<string, string>();
+function sendJsonRaw(res: ServerResponse, status: number, text: string, extra: Rec<string> = {}): void {
   const headers: Rec<string> = {
     'content-type': 'application/json; charset=utf-8',
     'x-github-request-id': `req-${++requestCounter}`,
@@ -337,7 +341,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extra: Rec
     ...extra,
   };
   res.writeHead(status, headers);
-  res.end(JSON.stringify(body));
+  res.end(text);
 }
 function sendRaw(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
   res.writeHead(status, { 'content-type': contentType });
@@ -624,19 +628,16 @@ function fetchResponse(repo: Repo, wants: string[], haves: string[], boundaries:
   parts.push(pkt('packfile\n'));
   const cacheKey = packCacheKey(wants, haves, boundaries, depth);
   const cached = cacheKey === null ? undefined : packCache.get(cacheKey);
-  if (cached !== undefined) {
-    parts.push(cached, FLUSH);
-    return Buffer.concat(parts);
-  }
+  if (cached !== undefined) return cached;
   const items: GitObj[] = [];
   for (const oid of send) {
     const obj = objects.get(oid);
     if (obj) items.push(obj);
   }
-  const framed = sideband(writePack(items));
-  if (cacheKey !== null) packCache.set(cacheKey, framed);
-  parts.push(framed, FLUSH);
-  return Buffer.concat(parts);
+  parts.push(sideband(writePack(items)), FLUSH);
+  const out = Buffer.concat(parts);
+  if (cacheKey !== null) packCache.set(cacheKey, out);
+  return out;
 }
 function gitResult(res: ServerResponse, service: 'git-upload-pack' | 'git-receive-pack', body: Buffer): void {
   sendRaw(res, 200, `application/x-${service}-result`, body);
@@ -930,10 +931,17 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
     const number = parseInt(rest[1] ?? '', 10);
     const issue = Number.isFinite(number) ? repo.issues.get(number) : undefined;
     if (rest.length === 2 && !issue) { sendJson(res, 404, { message: 'Not Found' }); return; }
-    if (rest.length === 2 && method === 'GET') { sendJson(res, 200, issueJson(issue ?? {} as Issue)); return; }
+    if (rest.length === 2 && method === 'GET') {
+      const key = `${repoKey(owner, name)}#${(issue as Issue).number}`;
+      const cached = issueCache.get(key);
+      if (cached !== undefined) { sendJsonRaw(res, 200, cached); return; }
+      const text = JSON.stringify(issueJson(issue as Issue));
+      issueCache.set(key, text);
+      sendJsonRaw(res, 200, text);
+      return;
+    }
     if (rest.length === 2 && method === 'PATCH') {
-      if (body.state === 'open' || body.state === 'closed') (issue as Issue).state = body.state;
-      journal('issue-state', { repo: repoKey(owner, name), number, state: (issue as Issue).state });
+      if (body.state === 'open' || body.state === 'closed') { (issue as Issue).state = body.state; issueCache.delete(`${repoKey(owner, name)}#${(issue as Issue).number}`); }
       sendJson(res, 200, issueJson(issue ?? {} as Issue));
       return;
     }
