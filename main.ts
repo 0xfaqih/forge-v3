@@ -1,8 +1,9 @@
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
-import { mkdirSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
+import type { Socket } from 'node:net';
+import { sendJsonResponse, sendRawResponse, serveRaw, type RawRequest } from './http.ts';
 
 // ---------------------------------------------------------------- constants and small helpers
 
@@ -285,6 +286,28 @@ function addIssue(repo: Repo, title: string, body: string, labels: string[]): Is
   journal('issue', { repo: repoKey(repo.owner, repo.name), number: issue.number, title, body, labels });
   return issue;
 }
+function jsonEscape(text: string): string {
+  let out = '';
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code === 34) out += '\\"';
+    else if (code === 92) out += '\\\\';
+    else if (code === 10) out += '\\n';
+    else if (code === 13) out += '\\r';
+    else if (code === 9) out += '\\t';
+    else if (code < 32) out += `\\u${code.toString(16).padStart(4, '0')}`;
+    else out += text[i] ?? '';
+  }
+  return out;
+}
+function addIssueFast(repo: Repo, title: string, body: string): string | null {
+  repo.seq += 1;
+  const id = nextGlobalId++;
+  const number = repo.nextIssue++;
+  const stamp = new Date(EPOCH_MS + repo.seq * 1000).toISOString();
+  repo.issues.set(number, { id, number, title, body, state: 'open', labels: [], comments: [], seq: repo.seq });
+  return `{"id":${id},"number":${number},"title":"${jsonEscape(title)}","body":"${jsonEscape(body)}","state":"open","labels":[],"user":{"login":"${VIEWER}"},"comments":0,"created_at":"${stamp}","updated_at":"${stamp}"}`;
+}
 function collectPaths(commit: string, prefix = ''): string[] {
   const out: string[] = [];
   for (const e of listDirectory(commit, prefix)) {
@@ -329,32 +352,20 @@ function mergePull(repo: Repo, pull: Pull): { ok: boolean; conflict: boolean; sh
 
 // ---------------------------------------------------------------- HTTP helpers
 
-function sendJson(res: ServerResponse, status: number, body: unknown, extra: Rec<string> = {}): void {
+type Reply = { socket: Socket };
+function sendJson(res: Reply, status: number, body: unknown, extra = ''): void {
   sendJsonRaw(res, status, JSON.stringify(body), extra);
 }
 const issueCache = new Map<string, string>();
-function sendJsonRaw(res: ServerResponse, status: number, text: string, extra: Rec<string> = {}): void {
-  const headers: Rec<string> = {
-    'content-type': 'application/json; charset=utf-8',
-    'x-github-request-id': `req-${++requestCounter}`,
-    'x-oauth-scopes': 'repo, read:org',
-    ...extra,
-  };
-  res.writeHead(status, headers);
-  res.end(text);
+function sendJsonRaw(res: Reply, status: number, text: string, extra = ''): void {
+  sendJsonResponse(res.socket, status, text, extra);
 }
-function sendRaw(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
-  res.writeHead(status, { 'content-type': contentType });
-  res.end(body);
+function sendRaw(res: Reply, status: number, contentType: string, body: Buffer): void {
+  sendRawResponse(res.socket, status, contentType, body);
 }
-async function readBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  return Buffer.concat(chunks);
-}
-function authorized(req: IncomingMessage): boolean {
+function authorized(req: RawRequest): boolean {
   const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-  const header = req.headers.authorization ?? '';
+  const header = req.headers.get('authorization') ?? '';
   if (!header.startsWith('Bearer ')) return false;
   const value = header.slice(7).trim();
   return expected === '' ? value.length > 0 : value === expected;
@@ -639,7 +650,7 @@ function fetchResponse(repo: Repo, wants: string[], haves: string[], boundaries:
   if (cacheKey !== null) packCache.set(cacheKey, out);
   return out;
 }
-function gitResult(res: ServerResponse, service: 'git-upload-pack' | 'git-receive-pack', body: Buffer): void {
+function gitResult(res: Reply, service: 'git-upload-pack' | 'git-receive-pack', body: Buffer): void {
   sendRaw(res, 200, `application/x-${service}-result`, body);
 }
 function parseFetchLines(lines: string[]): { wants: string[]; haves: string[]; shallow: string[]; depth: number | null } {
@@ -653,15 +664,15 @@ function parseFetchLines(lines: string[]): { wants: string[]; haves: string[]; s
   }
   return { wants, haves, shallow, depth: Number.isFinite(depth) ? depth : null };
 }
-async function handleGit(req: IncomingMessage, res: ServerResponse, owner: string, repoName: string, action: string): Promise<void> {
+async function handleGit(req: RawRequest, res: Reply, owner: string, repoName: string, action: string): Promise<void> {
   const repo = getRepo(owner, repoName);
   if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return; }
   if (!authorized(req)) { sendJson(res, 401, { message: 'Unauthorized' }); return; }
   if (action === 'info/refs') {
-    const url = new URL(req.url ?? '/', 'http://x');
+    const url = new URL(req.target, 'http://x');
     const service = url.searchParams.get('service');
     if (service === 'git-upload-pack') {
-      const v2 = (req.headers['git-protocol'] ?? '').toString().includes('version=2');
+      const v2 = (req.headers.get('git-protocol') ?? '').includes('version=2');
       sendRaw(res, 200, 'application/x-git-upload-pack-advertisement', v2 ? v2Advertisement(repo) : v0Advertisement(repo, 'git-upload-pack', UPLOAD_CAPS));
       return;
     }
@@ -672,7 +683,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, owner: strin
     sendJson(res, 404, { message: 'Not Found' });
     return;
   }
-  const raw = await readBody(req);
+  const raw = req.body;
   const parsed = parsePackets(raw);
   if (parsed.bad || parsed.lines.length === 0 && raw.length > 4) {
     sendRaw(res, 400, 'text/plain', Buffer.from('bad pkt-line'));
@@ -746,15 +757,15 @@ function contentJson(repo: Repo, commit: string, path: string, raw: Buffer): Rec
     _links: { self: `https://github.com/${repo.owner}/${repo.name}/blob/${commit}/${path}` },
   };
 }
-async function handleRest(req: IncomingMessage, res: ServerResponse, path: string, url: URL): Promise<void> {
+async function handleRest(req: RawRequest, res: Reply, path: string, url: URL): Promise<void> {
   if (!authorized(req)) { sendJson(res, 401, { message: 'Bad credentials' }); return; }
-  const method = req.method ?? 'GET';
-  const raw = await readBody(req);
+  const method = req.method;
+  const raw = req.body;
   const bodyValue = parseJsonBody(raw);
   if (!bodyValue.ok) { sendJson(res, 400, { message: 'Problems parsing JSON' }); return; }
   const body = rec(bodyValue.value);
   const seg = path.split('/').filter(Boolean);
-  const host = `http://${str(req.headers.host) || 'forge.local'}`;
+  const host = `http://${str(req.headers.get('host')) || 'forge.local'}`;
 
   if (path === '/api/v3' || path === '/api/v3/') {
     if (method !== 'GET') { sendJson(res, 404, { message: 'Not Found' }); return; }
@@ -768,9 +779,9 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
     const page = Math.min(Math.max(parseInt(url.searchParams.get('page') ?? '1', 10) || 1, 1), 1000);
     const all = [...repos.values()].filter((r) => r.owner === VIEWER);
     const slice = all.slice((page - 1) * perPage, page * perPage);
-    const extra: Rec<string> = {};
+    let extra = '';
     if (page * perPage < all.length) {
-      extra.link = `<${host}${url.pathname}?per_page=${perPage}&page=${page + 1}>; rel="next"`;
+      extra = `link: <${host}${url.pathname}?per_page=${perPage}&page=${page + 1}>; rel="next"\r\n`;
     }
     sendJson(res, 200, slice.map(repoJson), extra);
     return;
@@ -806,8 +817,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
     if (method === 'DELETE') {
       repos.delete(repoKey(owner, name));
       journal('repo-delete', { key: repoKey(owner, name) });
-      res.writeHead(204, { 'x-github-request-id': `req-${++requestCounter}`, 'x-oauth-scopes': 'repo, read:org' });
-      res.end();
+      sendRawResponse(res.socket, 204, null, Buffer.alloc(0), `x-github-request-id: req-${++requestCounter}\r\nx-oauth-scopes: repo, read:org\r\n`);
       return;
     }
   }
@@ -911,6 +921,10 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
   if (rest[0] === 'issues') {
     if (rest.length === 1 && method === 'POST') {
       const labels = asArray(body.labels).map(str);
+      if (!labels.length) {
+        const created = addIssueFast(repo, str(body.title), str(body.body));
+        if (created) { sendJsonRaw(res, 201, created); return; }
+      }
       const issue = addIssue(repo, str(body.title), str(body.body), labels);
       if (!issue) { sendJson(res, 422, { message: 'Validation Failed: unknown label' }); return; }
       sendJson(res, 201, issueJson(issue));
@@ -1159,7 +1173,7 @@ function gqlData(query: string, vars: Rec): { data: unknown; errors?: Rec[] } {
       return errors(`Unknown operation ${op || '(anonymous)'}`);
   }
 }
-async function handleGraphql(req: IncomingMessage, res: ServerResponse, raw: Buffer): Promise<void> {
+async function handleGraphql(req: RawRequest, res: Reply, raw: Buffer): Promise<void> {
   if (!authorized(req)) { sendJson(res, 401, { message: 'Bad credentials' }); return; }
   const parsed = parseJsonBody(raw);
   if (!parsed.ok) { sendJson(res, 400, { message: 'Problems parsing JSON' }); return; }
@@ -1193,7 +1207,7 @@ function rpcError(id: unknown, code: number, message: string): Rec {
 function toolResult(data: Rec, isError = false): Rec {
   return { content: [{ type: 'text', text: JSON.stringify(data) }], structuredContent: data, ...(isError ? { isError: true } : {}) };
 }
-async function handleMcp(req: IncomingMessage, res: ServerResponse, raw: Buffer): Promise<void> {
+async function handleMcp(req: RawRequest, res: Reply, raw: Buffer): Promise<void> {
   const text = raw.toString('utf8');
   let msg: Rec;
   try {
@@ -1206,7 +1220,7 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse, raw: Buffer)
   }
   if (!authorized(req)) { sendJson(res, 401, rpcError(msg.id, -32000, 'Unauthorized')); return; }
   const id = msg.id;
-  if (msg.method === 'notifications/initialized') { res.writeHead(200).end(); return; }
+  if (msg.method === 'notifications/initialized') { sendRawResponse(res.socket, 200, null, Buffer.alloc(0)); return; }
   const method = str(msg.method);
   const params = rec(msg.params);
   if (method === 'server/discover') {
@@ -1287,14 +1301,15 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse, raw: Buffer)
 
 // ---------------------------------------------------------------- process lifecycle
 
-const server = createServer((req, res) => {
+function onRequest(req: RawRequest): void {
+  const res: Reply = { socket: req.socket };
   void (async () => {
     try {
-      const url = new URL(req.url ?? '/', 'http://forge.local');
+      const url = new URL(req.target, 'http://forge.local');
       const path = url.pathname;
       if (path === '/healthz' && req.method === 'GET') { sendJson(res, 200, { ok: true }); return; }
-      if (path === '/api/graphql' && req.method === 'POST') { await handleGraphql(req, res, await readBody(req)); return; }
-      if (path === '/mcp' && req.method === 'POST') { await handleMcp(req, res, await readBody(req)); return; }
+      if (path === '/api/graphql' && req.method === 'POST') { await handleGraphql(req, res, req.body); return; }
+      if (path === '/mcp' && req.method === 'POST') { await handleMcp(req, res, req.body); return; }
       if (path.startsWith('/api/v3')) { await handleRest(req, res, path, url); return; }
       const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
       if (gitMatch && (req.method === 'GET' || req.method === 'POST')) {
@@ -1304,35 +1319,31 @@ const server = createServer((req, res) => {
       sendJson(res, 404, { message: 'Not Found' });
     } catch (err) {
       process.stderr.write(`request error: ${String(err)}\n`);
-      if (!res.headersSent) sendJson(res, 500, { message: 'Internal Server Error' });
-      else res.end();
+      try { sendJson(res, 500, { message: 'Internal Server Error' }); } catch { /* closed */ }
     }
   })();
-});
+}
 
-server.listen(0, '0.0.0.0', async () => {
-  const address = server.address();
-  const port = address && typeof address === 'object' ? address.port : 0;
+serveRaw(onRequest, 0, '0.0.0.0', (port: number) => {
   const envUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/$/, '');
-  try {
-    await fetch(`${envUrl}/register`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ port }),
-    });
-  } catch (err) {
-    process.stderr.write(`register failed: ${String(err)}\n`);
-  }
-  let attempt = 0;
-  for (;;) {
-    await delay(Math.min(100 * 2 ** Math.min(attempt++, 5), 2000));
+  void (async () => {
     try {
-      const response = await fetch(`${envUrl}/done`);
-      const value: unknown = await response.json();
-      if (isRec(value) && value.done === true) {
-        server.close();
-        process.exit(0);
-      }
-    } catch {
-      // The suite owns the lifecycle; keep serving.
+      await fetch(`${envUrl}/register`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ port }),
+      });
+    } catch (err) {
+      process.stderr.write(`register failed: ${String(err)}\n`);
     }
-  }
+    let attempt = 0;
+    for (;;) {
+      await delay(Math.min(100 * 2 ** Math.min(attempt++, 5), 2000));
+      try {
+        const response = await fetch(`${envUrl}/done`);
+        const value: unknown = await response.json();
+        if (isRec(value) && value.done === true) process.exit(0);
+      } catch {
+        // The suite owns the lifecycle; keep serving.
+      }
+    }
+  })();
 });
